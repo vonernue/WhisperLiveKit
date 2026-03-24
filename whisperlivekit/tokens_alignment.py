@@ -164,12 +164,24 @@ class TokensAlignment:
         """Merge consecutive diarization slices that share the same speaker."""
         if not self.all_diarization_segments:
             return []
-        merged = [self.all_diarization_segments[0]]
+        merged = [
+            SpeakerSegment(
+                start=self.all_diarization_segments[0].start,
+                end=self.all_diarization_segments[0].end,
+                speaker=self.all_diarization_segments[0].speaker,
+            )
+        ]
         for segment in self.all_diarization_segments[1:]:
             if segment.speaker == merged[-1].speaker:
                 merged[-1].end = segment.end
             else:
-                merged.append(segment)
+                merged.append(
+                    SpeakerSegment(
+                        start=segment.start,
+                        end=segment.end,
+                        speaker=segment.speaker,
+                    )
+                )
         return merged
 
 
@@ -181,37 +193,88 @@ class TokensAlignment:
 
         return max(0, end - start)
 
+    def _speaker_for_token(
+        self,
+        token: ASRToken,
+        diarization_segments: List[SpeakerSegment],
+    ) -> Optional[int]:
+        """Return the 1-based speaker id with the largest overlap for a token."""
+        max_overlap = 0.0
+        max_overlap_speaker: Optional[int] = None
+        for diarization_segment in diarization_segments:
+            intersec = self.intersection_duration(token, diarization_segment)
+            if intersec > max_overlap:
+                max_overlap = intersec
+                max_overlap_speaker = diarization_segment.speaker + 1
+        return max_overlap_speaker
+
+    @staticmethod
+    def _segment_from_token_group(tokens: List[ASRToken], speaker: int) -> Optional[Segment]:
+        """Build a text segment from tokens and attach the resolved speaker id."""
+        segment = Segment.from_tokens(tokens)
+        if segment is None:
+            return None
+        segment.speaker = speaker
+        return segment
+
+    def build_token_speaker_segments(
+        self,
+        diarization_segments: List[SpeakerSegment],
+    ) -> Tuple[List[Segment], str]:
+        """Split transcript using token-level speaker overlap instead of punctuation."""
+        diarization_buffer = ''
+        if not diarization_segments:
+            return self.compute_punctuations_segments(), diarization_buffer
+
+        segments: List[Segment] = []
+        pending_tokens: List[ASRToken] = []
+        pending_speaker: Optional[int] = None
+        last_diarization_end = diarization_segments[-1].end
+
+        def flush_pending() -> None:
+            nonlocal pending_tokens, pending_speaker
+            if not pending_tokens or pending_speaker is None:
+                pending_tokens = []
+                pending_speaker = None
+                return
+            segment = self._segment_from_token_group(pending_tokens, pending_speaker)
+            if segment is not None:
+                segments.append(segment)
+            pending_tokens = []
+            pending_speaker = None
+
+        for token in self.all_tokens:
+            if token.is_silence():
+                flush_pending()
+                silence_segment = Segment.from_tokens([token], is_silence=True)
+                if silence_segment is not None:
+                    segments.append(silence_segment)
+                continue
+
+            if token.start >= last_diarization_end:
+                diarization_buffer += token.text
+                continue
+
+            speaker = self._speaker_for_token(token, diarization_segments)
+            if speaker is None:
+                diarization_buffer += token.text
+                continue
+
+            if pending_speaker is None or speaker == pending_speaker:
+                pending_tokens.append(token)
+                pending_speaker = speaker
+            else:
+                flush_pending()
+                pending_tokens.append(token)
+                pending_speaker = speaker
+
+        flush_pending()
+        return segments, diarization_buffer
+
     def get_lines_diarization(self) -> Tuple[List[Segment], str]:
         """Build segments when diarization is enabled and track overflow buffer."""
-        diarization_buffer = ''
-        punctuation_segments = self.compute_punctuations_segments()
         diarization_segments = self.concatenate_diar_segments()
-        for punctuation_segment in punctuation_segments:
-            if not punctuation_segment.is_silence():
-                if diarization_segments and punctuation_segment.start >= diarization_segments[-1].end:
-                    diarization_buffer += punctuation_segment.text
-                else:
-                    max_overlap = 0.0
-                    max_overlap_speaker = 1
-                    for diarization_segment in diarization_segments:
-                        intersec = self.intersection_duration(punctuation_segment, diarization_segment)
-                        if intersec > max_overlap:
-                            max_overlap = intersec
-                            max_overlap_speaker = diarization_segment.speaker + 1
-                    punctuation_segment.speaker = max_overlap_speaker
-
-        segments = []
-        if punctuation_segments:
-            segments = [punctuation_segments[0]]
-            for segment in punctuation_segments[1:]:
-                if segment.speaker == segments[-1].speaker:
-                    if segments[-1].text:
-                        segments[-1].text += segment.text
-                    segments[-1].end = segment.end
-                else:
-                    segments.append(segment)
-
-        return segments, diarization_buffer
+        return self.build_token_speaker_segments(diarization_segments)
 
 
     def get_lines(
