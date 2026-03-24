@@ -31,6 +31,13 @@ let configReadyResolve;
 const configReady = new Promise((r) => (configReadyResolve = r));
 let outputAudioContext = null;
 let audioSource = null;
+let activeInputStream = null;
+const workletModuleUrl = isExtension
+  ? chrome.runtime.getURL("pcm_worklet.js")
+  : "/web/pcm_worklet.js";
+const recorderWorkerUrl = isExtension
+  ? chrome.runtime.getURL("recorder_worker.js")
+  : "/web/recorder_worker.js";
 
 waveCanvas.width = 60 * (window.devicePixelRatio || 1);
 waveCanvas.height = 30 * (window.devicePixelRatio || 1);
@@ -525,6 +532,11 @@ async function startRecording() {
       console.log("Error acquiring wake lock.");
     }
 
+    if (activeInputStream && activeInputStream.getTracks().some((track) => track.readyState === "live")) {
+      statusText.textContent = "Tab audio capture is already active. Stop it before starting again.";
+      return;
+    }
+
     let stream;
     
     // chromium extension. in the future, both chrome page audio and mic will be used
@@ -550,12 +562,8 @@ async function startRecording() {
         
         statusText.textContent = "Using tab audio capture.";
       } catch (tabError) {
-        console.log('Tab capture not available, falling back to microphone', tabError);
-        const audioConstraints = selectedMicrophoneId
-          ? { audio: { deviceId: { exact: selectedMicrophoneId } } }
-          : { audio: true };
-        stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
-        statusText.textContent = "Using microphone audio.";
+        statusText.textContent = "Tab audio capture failed. Close any previous capture and try again.";
+        throw tabError;
       }
     } else if (isWebContext) {
       const audioConstraints = selectedMicrophoneId 
@@ -564,6 +572,7 @@ async function startRecording() {
       stream = await navigator.mediaDevices.getUserMedia(audioConstraints);
     }
 
+    activeInputStream = stream;
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioContext.createAnalyser();
     analyser.fftSize = 256;
@@ -574,11 +583,11 @@ async function startRecording() {
       if (!audioContext.audioWorklet) {
         throw new Error("AudioWorklet is not supported in this browser");
       }
-      await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");
+      await audioContext.audioWorklet.addModule(workletModuleUrl);
       workletNode = new AudioWorkletNode(audioContext, "pcm-forwarder", { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
       microphone.connect(workletNode);
 
-      recorderWorker = new Worker("/web/recorder_worker.js");
+      recorderWorker = new Worker(recorderWorkerUrl);
       recorderWorker.postMessage({
         command: "init",
         config: {
@@ -626,7 +635,9 @@ async function startRecording() {
     isRecording = true;
     updateUI();
   } catch (err) {
-    if (window.location.hostname === "0.0.0.0") {
+    if (isExtension) {
+      statusText.textContent = "Error accessing tab audio. Make sure no previous tab capture is still active.";
+    } else if (window.location.hostname === "0.0.0.0") {
       statusText.textContent =
         "Error accessing microphone. Browsers may block microphone access on 0.0.0.0. Try using localhost:8000 instead.";
     } else {
@@ -706,6 +717,17 @@ async function stopRecording() {
     outputAudioContext = null;
   }
 
+  if (activeInputStream) {
+    activeInputStream.getTracks().forEach((track) => {
+      try {
+        track.stop();
+      } catch (e) {
+        console.warn("Could not stop input track:", e);
+      }
+    });
+    activeInputStream = null;
+  }
+
   if (animationFrame) {
     cancelAnimationFrame(animationFrame);
     animationFrame = null;
@@ -720,6 +742,13 @@ async function stopRecording() {
 
   isRecording = false;
   updateUI();
+}
+
+function cleanupOnPopupClose() {
+  if (!activeInputStream && !isRecording) {
+    return;
+  }
+  void stopRecording();
 }
 
 async function toggleRecording() {
@@ -776,6 +805,8 @@ recordButton.addEventListener("click", toggleRecording);
 if (microphoneSelect) {
   microphoneSelect.addEventListener("change", handleMicrophoneChange);
 }
+window.addEventListener("pagehide", cleanupOnPopupClose);
+window.addEventListener("beforeunload", cleanupOnPopupClose);
 document.addEventListener('DOMContentLoaded', async () => {
   try {
     await enumerateMicrophones();
