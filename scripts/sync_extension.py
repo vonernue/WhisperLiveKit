@@ -10,7 +10,8 @@ def sync_extension_files():
     extension_dir = Path("chrome-extension")
 
     files_to_sync = [
-        "live_transcription.html", "live_transcription.js", "live_transcription.css"
+        "live_transcription.html", "live_transcription.js", "live_transcription.css",
+        "pcm_worklet.js", "recorder_worker.js"
     ]
 
     svg_files = [

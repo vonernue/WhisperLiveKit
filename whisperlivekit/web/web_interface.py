@@ -29,16 +29,18 @@ def get_inline_ui_html():
             worker_code = f.read()
 
         js_content = js_content.replace(
-            'await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");',
+            'const workletModuleUrl = isExtension\n'
+            '  ? chrome.runtime.getURL("pcm_worklet.js")\n'
+            '  : "/web/pcm_worklet.js";',
             'const workletBlob = new Blob([`' + worklet_code + '`], { type: "application/javascript" });\n' +
-            'const workletUrl = URL.createObjectURL(workletBlob);\n' +
-            'await audioContext.audioWorklet.addModule(workletUrl);'
+            'const workletModuleUrl = URL.createObjectURL(workletBlob);'
         )
         js_content = js_content.replace(
-            'recorderWorker = new Worker("/web/recorder_worker.js");',
+            'const recorderWorkerUrl = isExtension\n'
+            '  ? chrome.runtime.getURL("recorder_worker.js")\n'
+            '  : "/web/recorder_worker.js";',
             'const workerBlob = new Blob([`' + worker_code + '`], { type: "application/javascript" });\n' +
-            'const workerUrl = URL.createObjectURL(workerBlob);\n' +
-            'recorderWorker = new Worker(workerUrl);'
+            'const recorderWorkerUrl = URL.createObjectURL(workerBlob);'
         )
 
         # SVG files
