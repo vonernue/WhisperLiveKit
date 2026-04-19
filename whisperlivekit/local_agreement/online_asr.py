@@ -148,6 +148,7 @@ class OnlineASRProcessor:
         self.buffer_time_offset = offset if offset is not None else 0.0
         self.transcript_buffer.last_committed_time = self.buffer_time_offset
         self.committed: List[ASRToken] = []
+        self.current_segment_ends: List[float] = []
         self.time_of_last_asr_output = 0.0
 
     def get_audio_buffer_end_time(self) -> float:
@@ -227,6 +228,7 @@ class OnlineASRProcessor:
             f"Transcribing {len(self.audio_buffer)/self.SAMPLING_RATE:.2f} seconds from {self.buffer_time_offset:.2f}"
         )
         res = self.asr.transcribe(self.audio_buffer, init_prompt=prompt_text)
+        self.current_segment_ends = [end + self.buffer_time_offset for end in self.asr.segments_end_ts(res)]
         tokens = self.asr.ts_words(res)
         self.transcript_buffer.insert(tokens, self.buffer_time_offset)
         committed_tokens = self.transcript_buffer.flush()

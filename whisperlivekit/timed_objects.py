@@ -232,5 +232,7 @@ class State():
     new_tokens: List[Union[ASRToken, Silence]] = field(default_factory=list)
     new_translation: List[Any] = field(default_factory=list)
     new_diarization: List[Any] = field(default_factory=list)
+    asr_segment_ends: List[float] = field(default_factory=list)
+    new_asr_segment_ends: List[float] = field(default_factory=list)
     new_tokens_buffer: List[Any] = field(default_factory=list)  # only when local agreement
     new_translation_buffer: TimedText = field(default_factory=TimedText)

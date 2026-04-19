@@ -15,7 +15,7 @@ from whisperlivekit.core import (
 from whisperlivekit.ffmpeg_manager import FFmpegManager, FFmpegState
 from whisperlivekit.metrics_collector import SessionMetrics
 from whisperlivekit.silero_vad_iterator import FixedVADIterator, OnnxWrapper, load_jit_vad
-from whisperlivekit.timed_objects import ChangeSpeaker, FrontData, Silence, State
+from whisperlivekit.timed_objects import ASRToken, ChangeSpeaker, FrontData, Silence, State, Transcript
 from whisperlivekit.tokens_alignment import TokensAlignment
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -24,6 +24,40 @@ logger.setLevel(logging.DEBUG)
 
 SENTINEL = object() # unique sentinel object for end of stream marker
 MIN_DURATION_REAL_SILENCE = 5
+
+
+def _normalize_transcription_buffer(
+    buffer_transcript: Transcript,
+    committed_tokens: List[ASRToken],
+    sep: str,
+) -> Transcript:
+    """Drop buffer text that is already committed.
+
+    ``get_buffer()`` may temporarily include text that has just been committed.
+    When the buffered transcript does not extend past the newest committed token
+    in time, it is stale and should be cleared. We also keep the existing
+    prefix-trimming path for backends that report committed text at the start of
+    the live buffer.
+    """
+    if not buffer_transcript or not buffer_transcript.text or not committed_tokens:
+        return buffer_transcript
+
+    last_committed_end = committed_tokens[-1].end
+    if (
+        buffer_transcript.end is not None
+        and last_committed_end is not None
+        and buffer_transcript.end <= last_committed_end + 1e-6
+    ):
+        return Transcript()
+
+    validated_text = sep.join(token.text for token in committed_tokens)
+    if validated_text and buffer_transcript.text.startswith(validated_text):
+        trimmed = buffer_transcript.text[len(validated_text):].lstrip()
+        if not trimmed:
+            return Transcript()
+        buffer_transcript.text = trimmed
+
+    return buffer_transcript
 
 async def get_all_from_queue(queue: asyncio.Queue) -> Union[object, Silence, np.ndarray, List[Any]]:
     items: List[Any] = []
@@ -293,6 +327,11 @@ class AudioProcessor:
                 logger.info(f"Finish flushed {len(final_tokens)} tokens")
                 self.metrics.n_tokens_produced += len(final_tokens)
                 _buffer_transcript = self.transcription.get_buffer()
+                _buffer_transcript = _normalize_transcription_buffer(
+                    _buffer_transcript,
+                    final_tokens,
+                    self.sep,
+                )
                 async with self.lock:
                     self.state.tokens.extend(final_tokens)
                     self.state.buffer_transcription = _buffer_transcript
@@ -375,12 +414,11 @@ class AudioProcessor:
                     self.metrics.n_tokens_produced += len(new_tokens)
 
                 _buffer_transcript = self.transcription.get_buffer()
-                buffer_text = _buffer_transcript.text
-
-                if new_tokens:
-                    validated_text = self.sep.join([t.text for t in new_tokens])
-                    if buffer_text.startswith(validated_text):
-                        _buffer_transcript.text = buffer_text[len(validated_text):].lstrip()
+                _buffer_transcript = _normalize_transcription_buffer(
+                    _buffer_transcript,
+                    new_tokens,
+                    self.sep,
+                )
 
                 candidate_end_times = [self.state.end_buffer]
 
@@ -397,6 +435,8 @@ class AudioProcessor:
                     self.state.buffer_transcription = _buffer_transcript
                     self.state.end_buffer = max(candidate_end_times)
                     self.state.new_tokens.extend(new_tokens)
+                    self.state.asr_segment_ends = getattr(self.transcription, "current_segment_ends", [])
+                    self.state.new_asr_segment_ends = getattr(self.transcription, "current_segment_ends", [])
                     self.state.new_tokens_buffer = _buffer_transcript
 
                 if self.translation_queue:
@@ -423,23 +463,45 @@ class AudioProcessor:
             try:
                 item = await get_all_from_queue(self.diarization_queue)
                 if item is SENTINEL:
+                    diarization_segments = await self._drain_diarization_segments(flush=True)
+                    diar_end = 0.0
+                    if diarization_segments:
+                        diar_end = max(getattr(s, "end", 0.0) for s in diarization_segments)
+                    async with self.lock:
+                        self.state.new_diarization.extend(diarization_segments)
+                        self.state.end_attributed_speaker = max(self.state.end_attributed_speaker, diar_end)
                     break
                 elif isinstance(item, Silence):
                     if item.has_ended:
                         self.diarization.insert_silence(item.duration)
                     continue
                 self.diarization.insert_audio_chunk(item)
-                diarization_segments = await self.diarization.diarize()
+                diarization_segments = await self._drain_diarization_segments()
                 diar_end = 0.0
                 if diarization_segments:
                     diar_end = max(getattr(s, "end", 0.0) for s in diarization_segments)
                 async with self.lock:
-                    self.state.new_diarization = diarization_segments
+                    self.state.new_diarization.extend(diarization_segments)
                     self.state.end_attributed_speaker = max(self.state.end_attributed_speaker, diar_end)
             except Exception as e:
                 logger.warning(f"Exception in diarization_processor: {e}")
                 logger.warning(f"Traceback: {traceback.format_exc()}")
         logger.info("Diarization processor task finished.")
+
+    async def _drain_diarization_segments(self, flush: bool = False) -> List[Any]:
+        """Drain every ready diarization chunk from the backend.
+
+        Sortformer buffers audio internally and only emits one chunk per ``diarize()``
+        call. When the queue batches multiple PCM chunks together, we need to keep
+        draining until the backend no longer has a full chunk ready. On shutdown we
+        also flush the trailing partial chunk so speaker attribution can catch up to
+        the end of the stream.
+        """
+        if hasattr(self.diarization, "drain_ready_segments"):
+            return await self.diarization.drain_ready_segments(flush=flush)
+
+        diarization_segments = await self.diarization.diarize()
+        return diarization_segments or []
 
     async def translation_processor(self) -> None:
         # the idea is to ignore diarization for the moment. We use only transcription tokens.
